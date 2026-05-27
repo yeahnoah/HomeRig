@@ -12,13 +12,15 @@ services:
   # automatically via a merged compose override at install time. We just
   # set APP_HOST/APP_PORT so the proxy knows where to forward.
   #
-  # APP_HOST uses the service name "web" — Docker compose's embedded DNS
-  # resolves it within the per-app network. Bitcoin/Mempool use static IPs
-  # via $APP_*_IP env vars, but the DNS service-name approach works too and
-  # avoids hardcoding subnets.
+  # APP_HOST uses the FULL container_name, not the service name.
+  # Reason: Umbrel runs all apps on shared Docker networks, and multiple
+  # community apps may use "web" as their service name — DNS for the bare
+  # name returns multiple IPs (one per app), causing the proxy to round-robin
+  # to whichever container responds first (probably not ours). The container
+  # name is unique across the host so DNS resolves to just our container.
   app_proxy:
     environment:
-      APP_HOST: web
+      APP_HOST: yeahnoah-homerig_web_1
       APP_PORT: 3000
       PROXY_AUTH_ADD: "false"
 
