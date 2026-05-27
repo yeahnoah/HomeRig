@@ -7,21 +7,25 @@
 # deterministic across container restarts and unique to this Umbrel install.
 # Set in ./exports.sh.
 
-version: "3.7"
-
 services:
+  # Umbrel injects this service's image (getumbrel/app-proxy) and ports
+  # automatically via a merged compose override at install time. We just
+  # set APP_HOST/APP_PORT so the proxy knows where to forward.
+  #
+  # APP_HOST uses the service name "web" — Docker compose's embedded DNS
+  # resolves it within the per-app network. Bitcoin/Mempool use static IPs
+  # via $APP_*_IP env vars, but the DNS service-name approach works too and
+  # avoids hardcoding subnets.
   app_proxy:
     environment:
-      # Container name format: <app-id>_<service>_1. Our app id is
-      # "yeahnoah-homerig" (required to start with the store id "yeahnoah" or
-      # umbreld filters it out — see app-repository.ts in umbreld source).
-      APP_HOST: yeahnoah-homerig_web_1
+      APP_HOST: web
       APP_PORT: 3000
       PROXY_AUTH_ADD: "false"
 
   web:
     image: ghcr.io/yeahnoah/homerig:latest
-    restart: unless-stopped
+    container_name: yeahnoah-homerig_web_1
+    restart: on-failure
     init: true
     stop_grace_period: 1m
     environment:
@@ -32,13 +36,6 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data:/app/data
     # The host's Home Assistant lives at host.docker.internal:8123 inside the
-    # container. Already wired up via the Settings page once the user pastes
-    # that URL there. host-gateway makes the bridge resolve to the Pi's host IP.
+    # container. Settings UI lets the user paste that URL.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/miners"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
