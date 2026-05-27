@@ -1,0 +1,41 @@
+# HomeRig — Umbrel community app deployment.
+#
+# Uses the pre-built image published by the repo's GitHub Actions workflow.
+# Data persists in ${APP_DATA_DIR}/data which Umbrel maps to a host volume.
+#
+# HOMERIG_ENCRYPTION_KEY is derived from the per-app APP_SEED so it's
+# deterministic across container restarts and unique to this Umbrel install.
+# Set in ./exports.sh.
+
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: homerig_web_1
+      APP_PORT: 3000
+      PROXY_AUTH_ADD: "false"
+
+  web:
+    image: ghcr.io/yeahnoah/homerig:latest
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 1m
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DB_PATH: /app/data/homerig.db
+      HOMERIG_ENCRYPTION_KEY: ${HOMERIG_ENCRYPTION_KEY}
+    volumes:
+      - ${APP_DATA_DIR}/data:/app/data
+    # The host's Home Assistant lives at host.docker.internal:8123 inside the
+    # container. Already wired up via the Settings page once the user pastes
+    # that URL there. host-gateway makes the bridge resolve to the Pi's host IP.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/miners"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

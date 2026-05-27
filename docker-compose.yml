@@ -1,0 +1,41 @@
+# Deploy on Umbrel (or any Docker host).
+#
+# Usage on the Umbrel after rsync:
+#   cd ~/homerig
+#   docker compose up -d --build
+#
+# Logs:    docker compose logs -f
+# Stop:    docker compose down
+# Update:  rsync new code in, then `docker compose up -d --build`
+#
+# Data persistence: ./data on the host gets mounted to /app/data in the container.
+# Encryption key persists in .env which is mounted read-only.
+
+services:
+  homerig:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: homerig
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DB_PATH: /app/data/homerig.db
+    volumes:
+      - ./data:/app/data
+    # Use the host's DNS resolver so umbrel.local resolves cleanly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Healthcheck hits the miners list endpoint. Falls into 'unhealthy' if the
+    # app can't even respond, which is rare but useful to detect.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/miners"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

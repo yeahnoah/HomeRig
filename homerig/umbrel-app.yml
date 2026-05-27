@@ -1,0 +1,54 @@
+manifestVersion: 1.1
+id: homerig
+category: automation
+name: HomeRig
+version: "0.1.0"
+tagline: Mining-rig scheduler for Antminer S21 XP on Braiins OS+
+description: >-
+  HomeRig is a local scheduler and live dashboard for Antminer S21 XP miners
+  running Braiins OS+. It manages on/off cycles based on blackout windows
+  (e.g. peak-pricing hours), controls a HomeKit fan plug through your local
+  Home Assistant, and tracks per-device electricity usage with accurate
+  meter-backed cost calculations.
+
+
+  Features:
+
+
+  - Live per-miner dashboard with hashrate, power, temps and sparklines
+
+  - Blackout-window scheduler with repeat-annually and multiple time slots
+
+  - Safety interlock: miners only run when the fan plug is confirmed ON
+
+  - Startup stagger so fans spin up before miners resume
+
+  - Per-device electricity cost ($/hr, $/day) with peak/off-peak rate handling
+
+  - Monthly bill projection including service charge, demand charge, and energy
+
+  - Push notifications via ntfy.sh, Discord, or Slack
+
+  - All credentials encrypted at rest
+
+
+  Designed for the Georgia Power TOU-RD residential plan but works with any
+  time-of-use rate. Requires Home Assistant with the Matter integration to
+  control the Eve Energy plug.
+developer: noah
+website: https://github.com/yeahnoah/HomeRig
+dependencies:
+  - home-assistant
+repo: https://github.com/yeahnoah/HomeRig
+support: https://github.com/yeahnoah/HomeRig/issues
+port: 3000
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+releaseNotes: >-
+  Initial release. Direct Matter-over-Thread plug control via Home Assistant,
+  meter-backed cost tracking, GA Power TOU-RD-11 defaults baked in.
+submitter: yeahnoah
+submission: https://github.com/yeahnoah/HomeRig

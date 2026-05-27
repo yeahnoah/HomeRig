@@ -1,26 +1,121 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* near-black industrial control panel */
+  --background: #0a0a0a;
+  --surface: #141414;
+  --surface-2: #1c1c1c;
+  --surface-3: #232323;
+  --border: #262626;
+  --border-strong: #383838;
+  --foreground: #ededed;
+  --muted: #888888;
+  --muted-strong: #a0a0a0;
+  --accent: #f5a524; /* amber */
+  --accent-dim: #8a5f17;
+  --accent-soft: #f5a52422; /* amber with low alpha for fills */
+  --green: #4ade80;
+  --green-soft: #4ade8022;
+  --red: #f87171;
+  --red-soft: #f8717122;
+  --blue: #60a5fa;
+  --blue-soft: #60a5fa22;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-muted: var(--muted);
+  --color-muted-strong: var(--muted-strong);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-accent-soft: var(--accent-soft);
+  --color-green: var(--green);
+  --color-green-soft: var(--green-soft);
+  --color-red: var(--red);
+  --color-red-soft: var(--red-soft);
+  --color-blue: var(--blue);
+  --color-blue-soft: var(--blue-soft);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html, body {
+  background: var(--background);
+  color: var(--foreground);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "ss01", "ss02", "cv05";
+}
+
+/* Hardware-LED status dot */
+.led {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.04), 0 0 8px currentColor;
+}
+.led--green { color: var(--green); background: currentColor; }
+.led--amber { color: var(--accent); background: currentColor; }
+.led--red   { color: var(--red); background: currentColor; }
+.led--gray  { color: #555; background: currentColor; box-shadow: 0 0 0 2px rgba(255,255,255,0.04); }
+
+/* Data readout */
+.data {
+  font-family: var(--font-plex-mono), ui-monospace, "SF Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle pulse on live values */
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+
+/* Soft fade-in for chart elements */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fade-up 0.4s ease-out both; }
+
+/* Hover lift for interactive cards */
+.card-hover {
+  transition: border-color 200ms ease, background-color 200ms ease;
+}
+.card-hover:hover { border-color: var(--border-strong); background-color: var(--surface-2); }
+
+/* Tabular numeric with kerning disabled for column-aligned data tables */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Recharts overrides — kill grid background, soften default colors */
+.recharts-cartesian-grid line {
+  stroke: var(--border);
+  stroke-opacity: 0.5;
+}
+.recharts-cartesian-axis-line {
+  stroke: var(--border);
+}
+.recharts-cartesian-axis-tick-line {
+  stroke: var(--border);
+}
+.recharts-cartesian-axis-tick text {
+  fill: var(--muted);
+  font-family: var(--font-plex-mono), monospace;
+  font-size: 10px;
+}
+.recharts-tooltip-wrapper {
+  outline: none !important;
 }

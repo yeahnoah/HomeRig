@@ -1,0 +1,9 @@
+node_modules
+.next
+data
+.git
+.env.local
+*.db
+*.db-wal
+*.db-shm
+homerig-stock.archive
