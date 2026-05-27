@@ -12,7 +12,10 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: homerig_web_1
+      # Container name format: <app-id>_<service>_1. Our app id is
+      # "yeahnoah-homerig" (required to start with the store id "yeahnoah" or
+      # umbreld filters it out — see app-repository.ts in umbreld source).
+      APP_HOST: yeahnoah-homerig_web_1
       APP_PORT: 3000
       PROXY_AUTH_ADD: "false"
 

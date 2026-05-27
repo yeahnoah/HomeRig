@@ -1,5 +1,7 @@
 manifestVersion: 1.1
-id: homerig
+# Umbrel filters community-store apps where the app id doesn't start with the
+# store id. Store id is "yeahnoah" (see ../umbrel-app-store.yml), so we prefix.
+id: yeahnoah-homerig
 category: automation
 name: HomeRig
 version: "0.1.0"
@@ -37,12 +39,10 @@ description: >-
   control the Eve Energy plug.
 developer: noah
 website: https://github.com/yeahnoah/HomeRig
-dependencies:
-  - home-assistant
+dependencies: []
 repo: https://github.com/yeahnoah/HomeRig
 support: https://github.com/yeahnoah/HomeRig/issues
 port: 3000
-gallery: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
