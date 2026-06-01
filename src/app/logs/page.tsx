@@ -2,6 +2,24 @@
 import { useEffect, useState } from 'react';
 import type { EventLogEntry } from '@/types';
 
+// event_log timestamps are stored as SQLite UTC strings ("YYYY-MM-DD HH:MM:SS"),
+// same as stats_history/plug_history. Append 'Z' so the browser parses them as UTC
+// and renders in the viewer's local timezone — keeping the log in sync with the
+// schedule (which the server evaluates in its local TZ).
+function fmtLocal(ts: string): string {
+  if (!ts) return '';
+  const d = new Date(ts.replace(' ', 'T') + 'Z');
+  if (Number.isNaN(d.getTime())) return ts; // fall back to raw string if unparseable
+  return d.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
 export default function LogsPage() {
   const [events, setEvents] = useState<EventLogEntry[]>([]);
 
@@ -36,7 +54,7 @@ export default function LogsPage() {
             )}
             {events.map((e) => (
               <tr key={e.id} className="border-t border-border">
-                <td className="px-3 py-2 data text-xs text-muted">{e.ts}</td>
+                <td className="px-3 py-2 data text-xs text-muted whitespace-nowrap">{fmtLocal(e.ts)}</td>
                 <td className="px-3 py-2 data">{e.miner_id ?? '—'}</td>
                 <td className="px-3 py-2">{e.action}</td>
                 <td className="px-3 py-2 text-muted">{e.source}</td>

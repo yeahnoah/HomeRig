@@ -35,6 +35,10 @@ services:
       PORT: "3000"
       DB_PATH: /app/data/homerig.db
       HOMERIG_ENCRYPTION_KEY: ${HOMERIG_ENCRYPTION_KEY}
+      # Blackout windows are entered in WALL-CLOCK time. The evaluator uses the
+      # container's local time (new Date().getHours()), so the container must run
+      # in the user's timezone — otherwise windows fire offset by the UTC delta.
+      TZ: America/New_York
     volumes:
       - ${APP_DATA_DIR}/data:/app/data
     # The host's Home Assistant lives at host.docker.internal:8123 inside the

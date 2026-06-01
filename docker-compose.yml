@@ -26,6 +26,8 @@ services:
       NODE_ENV: production
       PORT: "3000"
       DB_PATH: /app/data/homerig.db
+      # Blackout windows are wall-clock; the evaluator uses container-local time.
+      TZ: America/New_York
     volumes:
       - ./data:/app/data
     # Use the host's DNS resolver so umbrel.local resolves cleanly.
