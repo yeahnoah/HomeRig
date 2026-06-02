@@ -4,7 +4,7 @@ manifestVersion: 1.1
 id: yeahnoah-homerig
 category: automation
 name: HomeRig
-version: "0.1.0"
+version: "0.2.0"
 tagline: Mining-rig scheduler for Antminer S21 XP on Braiins OS+
 description: >-
   HomeRig is a local scheduler and live dashboard for Antminer S21 XP miners
@@ -48,7 +48,8 @@ defaultUsername: ""
 defaultPassword: ""
 torOnly: false
 releaseNotes: >-
-  Initial release. Direct Matter-over-Thread plug control via Home Assistant,
-  meter-backed cost tracking, GA Power TOU-RD-11 defaults baked in.
+  Fixes blackout windows firing at the wrong time of day: the container now
+  runs in America/New_York so windows are evaluated in wall-clock time instead
+  of UTC. The Event Log also renders timestamps in your local timezone.
 submitter: yeahnoah
 submission: https://github.com/yeahnoah/HomeRig
