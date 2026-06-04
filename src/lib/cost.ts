@@ -93,6 +93,23 @@ export function currentRateCentsPerKwh(now: Date = new Date()): number {
   return currentRatePeriod(now) === 'peak' ? cfg.rate_peak_cents : cfg.rate_offpeak_cents;
 }
 
+/**
+ * Build a reusable rate-period resolver. CRITICAL for the integration loops:
+ * `currentRatePeriod()` issues a fresh `getEnabledBlackouts()` DB query on every
+ * call, so calling it per history row is O(rows) SQLite queries — tens of
+ * thousands per request once history fills up, which blocks the event loop for
+ * tens of seconds. This fetches the windows ONCE and returns a pure closure that
+ * evaluates each timestamp in memory.
+ */
+function makeRatePeriodResolver(cfg: ElectricityConfig): (ts: Date) => RatePeriod {
+  if (!cfg.use_blackout_as_peak) return () => 'offpeak';
+  const windows = getEnabledBlackouts(); // one query, reused for every row
+  return (ts: Date) => {
+    for (const w of windows) if (windowIsActive(w, ts)) return 'peak';
+    return 'offpeak';
+  };
+}
+
 /** Convert watts × rate (cents/kWh) → dollars per hour. */
 export function costPerHour(watts: number, rateCentsPerKwh: number): number {
   if (!watts || watts <= 0) return 0;
@@ -150,6 +167,7 @@ export function estimateCostFromHistory(
   cfg: ElectricityConfig = getElectricityConfig()
 ): number {
   if (history.length === 0) return 0;
+  const resolvePeriod = makeRatePeriodResolver(cfg);
   let cost = 0;
   for (let i = 0; i < history.length - 1; i++) {
     const a = history[i];
@@ -159,7 +177,7 @@ export function estimateCostFromHistory(
     const dtMs = new Date(b.ts).getTime() - new Date(a.ts).getTime();
     if (dtMs <= 0 || dtMs > 10 * 60_000) continue; // skip gaps > 10 min (offline)
     const hours = dtMs / 3_600_000;
-    const period = currentRatePeriod(new Date(a.ts));
+    const period = resolvePeriod(new Date(a.ts));
     const rate = period === 'peak' ? cfg.rate_peak_cents : cfg.rate_offpeak_cents;
     cost += costPerHour(watts, rate) * hours;
   }
@@ -198,6 +216,7 @@ function integrateMinerCost(minutes: number, cfg: ElectricityConfig): { cost: nu
     if (!byMiner.has(r.miner_id)) byMiner.set(r.miner_id, []);
     byMiner.get(r.miner_id)!.push(r);
   }
+  const resolvePeriod = makeRatePeriodResolver(cfg);
   let cost = 0;
   let kwh = 0;
   for (const list of byMiner.values()) {
@@ -209,7 +228,7 @@ function integrateMinerCost(minutes: number, cfg: ElectricityConfig): { cost: nu
       const dtMs = new Date(b.ts).getTime() - new Date(a.ts).getTime();
       if (dtMs <= 0 || dtMs > 10 * 60_000) continue;
       const hours = dtMs / 3_600_000;
-      const period = currentRatePeriod(new Date(a.ts));
+      const period = resolvePeriod(new Date(a.ts));
       const rate = period === 'peak' ? cfg.rate_peak_cents : cfg.rate_offpeak_cents;
       cost += costPerHour(watts, rate) * hours;
       kwh += (watts / 1000) * hours;
@@ -224,6 +243,7 @@ function integratePlugCost(minutes: number, cfg: ElectricityConfig): { cost: num
   // Use the cumulative kWh meter. Walk adjacent rows, sum positive deltas
   // weighted by the rate at the older sample. Negative deltas (meter reset
   // after firmware update) are skipped.
+  const resolvePeriod = makeRatePeriodResolver(cfg);
   let cost = 0;
   let kwh = 0;
   for (let i = 0; i < rows.length - 1; i++) {
@@ -232,7 +252,7 @@ function integratePlugCost(minutes: number, cfg: ElectricityConfig): { cost: num
     if (a.plug_energy_kwh == null || b.plug_energy_kwh == null) continue;
     const delta = b.plug_energy_kwh - a.plug_energy_kwh;
     if (!Number.isFinite(delta) || delta <= 0 || delta > 1) continue; // 1kWh per interval is sanity ceiling
-    const period = currentRatePeriod(new Date(a.ts));
+    const period = resolvePeriod(new Date(a.ts));
     const rate = period === 'peak' ? cfg.rate_peak_cents : cfg.rate_offpeak_cents;
     cost += (delta * rate) / 100;
     kwh += delta;
