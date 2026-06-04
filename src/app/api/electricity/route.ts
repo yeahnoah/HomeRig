@@ -8,6 +8,7 @@ import {
   ELECTRICITY_KEYS,
   getSpendSummary,
   getMonthlySummary,
+  invalidateCostCache,
   type ElectricityConfigPatch,
 } from '@/lib/cost';
 
@@ -50,5 +51,7 @@ export async function PUT(req: NextRequest) {
     setSettingValue(ELECTRICITY_KEYS.service_charge_cents_per_day, String(body.service_charge_cents_per_day));
   if (body.demand_charge_dollars_per_kw !== undefined)
     setSettingValue(ELECTRICITY_KEYS.demand_charge_dollars_per_kw, String(body.demand_charge_dollars_per_kw));
+  // Rates changed — drop memoized summaries so the new rates take effect now.
+  invalidateCostCache();
   return NextResponse.json({ ok: true, config: getElectricityConfig() });
 }

@@ -260,15 +260,46 @@ function integratePlugCost(minutes: number, cfg: ElectricityConfig): { cost: num
   return { cost, kwh };
 }
 
+// ─── Summary cache ───────────────────────────────────────────────────────────
+//
+// getSpendSummary + getMonthlySummary integrate days of history rows on each
+// call (synchronous SQLite + JS loops). The dashboard polls /api/electricity
+// every ~10s, but these numbers barely move second-to-second, so we memoize for
+// a short TTL to keep that work — and the event-loop block it causes — off the
+// hot path. Rate edits call invalidateCostCache() so Settings changes are
+// reflected immediately rather than after the TTL.
+const SUMMARY_TTL_MS = 30_000;
+interface CacheBox<T> {
+  value: T;
+  at: number;
+}
+const cacheG = globalThis as unknown as {
+  __homerigCost?: {
+    spend: Map<number, CacheBox<SpendSummary>>;
+    monthly: CacheBox<MonthlySummary> | null;
+  };
+};
+const costCache =
+  cacheG.__homerigCost ?? (cacheG.__homerigCost = { spend: new Map(), monthly: null });
+
+/** Drop all memoized summaries — call after any electricity-rate change. */
+export function invalidateCostCache() {
+  costCache.spend.clear();
+  costCache.monthly = null;
+}
+
 /**
  * Compute a spend summary over the given window (default: today, last 24h).
  * Combines integrated miner power and the plug's meter-based fan energy.
+ * Memoized for SUMMARY_TTL_MS, keyed by window.
  */
 export function getSpendSummary(windowMinutes: number = 24 * 60): SpendSummary {
+  const cached = costCache.spend.get(windowMinutes);
+  if (cached && Date.now() - cached.at < SUMMARY_TTL_MS) return cached.value;
   const cfg = getElectricityConfig();
   const miner = integrateMinerCost(windowMinutes, cfg);
   const plug = integratePlugCost(windowMinutes, cfg);
-  return {
+  const value: SpendSummary = {
     miner_cost: miner.cost,
     plug_cost: plug.cost,
     total_cost: miner.cost + plug.cost,
@@ -277,6 +308,8 @@ export function getSpendSummary(windowMinutes: number = 24 * 60): SpendSummary {
     currency: cfg.currency,
     window_minutes: windowMinutes,
   };
+  costCache.spend.set(windowMinutes, { value, at: Date.now() });
+  return value;
 }
 
 // ─── Typical running power ───────────────────────────────────────────────────
@@ -444,7 +477,20 @@ function maxHourlyKw(
   return { peak_kw, peak_at };
 }
 
+/**
+ * Current month's bill projection. Memoized for SUMMARY_TTL_MS — this is the
+ * heaviest call (integrates the whole month-to-date plus an hourly demand-peak
+ * scan), and the dashboard polls it every ~10s.
+ */
 export function getMonthlySummary(now: Date = new Date()): MonthlySummary {
+  const cached = costCache.monthly;
+  if (cached && Date.now() - cached.at < SUMMARY_TTL_MS) return cached.value;
+  const value = computeMonthlySummary(now);
+  costCache.monthly = { value, at: Date.now() };
+  return value;
+}
+
+function computeMonthlySummary(now: Date): MonthlySummary {
   const cfg = getElectricityConfig();
   const monthStart = startOfCurrentMonth(now);
   // SQLite stores as 'YYYY-MM-DD HH:MM:SS' UTC. Format ours the same way.
