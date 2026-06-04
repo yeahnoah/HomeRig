@@ -4,7 +4,7 @@ manifestVersion: 1.1
 id: yeahnoah-homerig
 category: automation
 name: HomeRig
-version: "0.2.0"
+version: "0.3.0"
 tagline: Mining-rig scheduler for Antminer S21 XP on Braiins OS+
 description: >-
   HomeRig is a local scheduler and live dashboard for Antminer S21 XP miners
@@ -48,8 +48,12 @@ defaultUsername: ""
 defaultPassword: ""
 torOnly: false
 releaseNotes: >-
-  Fixes blackout windows firing at the wrong time of day: the container now
-  runs in America/New_York so windows are evaluated in wall-clock time instead
-  of UTC. The Event Log also renders timestamps in your local timezone.
+  New: profitability guard. Optionally pauses miners + fans when the live BTC
+  price falls below break-even (marginal energy cost ÷ BTC mined per day, via
+  the Braiins Pool API) and resumes when it recovers, with hysteresis to prevent
+  flapping. A manual price floor is also supported. Adds a Profitability card to
+  the dashboard and a settings section. Also fixes monthly bill accuracy: miner
+  and plug history are now retained for 40 days (was 7), so the monthly energy
+  total and demand-peak no longer truncate after a week.
 submitter: yeahnoah
 submission: https://github.com/yeahnoah/HomeRig

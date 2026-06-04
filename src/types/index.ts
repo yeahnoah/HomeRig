@@ -79,6 +79,37 @@ export interface PlugConfig {
   notify_on_miner_resume: 1 | 0;
 }
 
+/**
+ * Profitability guard config (singleton row, id=1).
+ *
+ * When enabled, the scheduler pauses miners + plug when the live BTC price drops
+ * below the break-even price (marginal energy cost ÷ BTC mined/day), with
+ * hysteresis to prevent flapping. Mirrors the plug_config table pattern.
+ */
+export interface ProfitConfig {
+  id: number;
+  /** Master switch for the profitability guard. */
+  enabled: 1 | 0;
+  /** Braiins Pool API token, encrypted at rest. */
+  pool_token_encrypted: string;
+  /** BTC price source: 'coinbase' | 'kraken'. */
+  price_source: string;
+  /** Price must stay below break-even this many minutes before we pause (hysteresis). */
+  pause_below_minutes: number;
+  /** Price must recover this % ABOVE break-even before we resume (hysteresis). */
+  resume_margin_pct: number;
+  /** When 1, use a fixed manual price floor instead of the dynamic break-even. */
+  manual_floor_enabled: 1 | 0;
+  /** Manual price floor in USD/BTC (used when manual_floor_enabled=1). */
+  manual_floor_usd: number;
+  /** Override for the rig's running power in watts (0 = auto-detect from history). */
+  running_watts_override: number;
+  /** Notify when the guard pauses the rig (price dropped below break-even). */
+  notify_on_trip: 1 | 0;
+  /** Notify when the guard resumes the rig (price recovered). */
+  notify_on_recover: 1 | 0;
+}
+
 export interface MinerStats {
   minerId: number;
   status: 'mining' | 'paused' | 'starting' | 'stopping' | 'error' | 'offline';

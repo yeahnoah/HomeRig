@@ -18,6 +18,7 @@ import {
   getEnabledMiners,
   getEnabledBlackouts,
   getPlugConfig,
+  getProfitConfig,
   getSettings,
   logEvent,
   insertStatsHistory,
@@ -33,6 +34,7 @@ import {
   getPlugEnergyKwh,
 } from './ha-plug';
 import { evaluateForMiner } from './blackouts';
+import { evaluateProfitability, type ProfitSnapshot } from './profitability';
 import { sendAlert, clearAlertDedup } from './alerts';
 import type { Miner, MinerStats } from '@/types';
 
@@ -63,6 +65,13 @@ interface SchedulerState {
    * user can resolve (via a manual web-UI reboot).
    */
   stuckResumeStreak: Map<number, number>;
+  // ── Profitability guard state ──
+  /** ms epoch when price first dropped below break-even (null = not below). */
+  profitBelowSince: number | null;
+  /** True while the guard is actively pausing the rig for unprofitability. */
+  profitTripped: boolean;
+  /** Last computed snapshot, surfaced to the dashboard via getProfitState(). */
+  lastProfitSnapshot: ProfitSnapshot | null;
 }
 const g = globalThis as unknown as { __homerig?: SchedulerState };
 const state: SchedulerState =
@@ -75,6 +84,9 @@ const state: SchedulerState =
     startedAt: 0,
     unknownStateStreak: 0,
     stuckResumeStreak: new Map(),
+    profitBelowSince: null,
+    profitTripped: false,
+    lastProfitSnapshot: null,
   });
 
 // ── Guard tunables ──
@@ -148,8 +160,10 @@ export async function pollAllMiners(): Promise<MinerStats[]> {
   if (pollsSinceLastPrune >= PRUNE_EVERY_N_POLLS) {
     pollsSinceLastPrune = 0;
     try {
-      pruneStatsHistory(7 * 24); // keep last 7 days
-      prunePlugHistory(30 * 24); // keep last 30 days of plug data for monthly cost
+      // Keep 40 days so getMonthlySummary() always has a full billing month of
+      // miner + plug samples to integrate energy and locate the demand peak.
+      pruneStatsHistory(40 * 24);
+      prunePlugHistory(40 * 24);
     } catch (err) {
       console.error('[poll] prune error:', err);
     }
@@ -359,18 +373,153 @@ async function notifyForReconcile(results: ApplyResult[]) {
   }
 }
 
+/** Snapshot of the profitability guard for the dashboard / API. */
+export interface ProfitGuardState {
+  tripped: boolean;
+  /** Seconds the price has been below the threshold (null if not below). */
+  below_for_seconds: number | null;
+  snapshot: ProfitSnapshot | null;
+}
+
+export function getProfitState(): ProfitGuardState {
+  return {
+    tripped: state.profitTripped,
+    below_for_seconds:
+      state.profitBelowSince != null ? Math.floor((Date.now() - state.profitBelowSince) / 1000) : null,
+    snapshot: state.lastProfitSnapshot,
+  };
+}
+
+/**
+ * Evaluate the profitability guard with hysteresis and update guard state.
+ * Returns whether the rig should be paused for unprofitability right now.
+ *
+ * Hysteresis:
+ *   - Not tripped → price must stay below the threshold for `pause_below_minutes`
+ *     before we trip (a brief dip won't pause the rig).
+ *   - Tripped → price must recover to `threshold × (1 + resume_margin_pct/100)`
+ *     before we resume (prevents flapping right at the line).
+ *
+ * Fail safe: if the guard is disabled or any input is missing (price, BTC/day,
+ * running-power history), we never pause — and we clear any existing trip so a
+ * data outage can't strand the rig in a paused state.
+ */
+async function evaluateProfitGuard(now: Date): Promise<boolean> {
+  const cfg = getProfitConfig();
+  const snap = await evaluateProfitability(now);
+  state.lastProfitSnapshot = snap;
+
+  if (!snap.enabled || !snap.evaluable) {
+    // Fail safe: don't pause, reset the timer, and clear any active trip.
+    state.profitBelowSince = null;
+    if (state.profitTripped) {
+      state.profitTripped = false;
+      logEvent({
+        miner_id: null,
+        action: 'system',
+        source: 'profit:guard',
+        result: 'success',
+        detail: `Profit guard released (resuming): ${snap.reason}`,
+      });
+      clearAlertDedup('profit:trip');
+    }
+    return false;
+  }
+
+  const price = snap.btc_price_usd as number;
+  const threshold = snap.threshold_usd as number;
+  const label = snap.manual_floor_active ? 'manual floor' : 'break-even';
+
+  if (!state.profitTripped) {
+    // Currently running — decide whether to trip.
+    if (price < threshold) {
+      if (state.profitBelowSince == null) state.profitBelowSince = now.getTime();
+      const belowMin = (now.getTime() - state.profitBelowSince) / 60_000;
+      if (belowMin >= cfg.pause_below_minutes) {
+        state.profitTripped = true;
+        logEvent({
+          miner_id: null,
+          action: 'system',
+          source: 'profit:guard',
+          result: 'error',
+          detail: `Profit guard tripped: ${snap.reason} (held ${Math.round(belowMin)}m)`,
+        });
+        if (cfg.notify_on_trip) {
+          await sendAlert({
+            key: 'profit:trip',
+            title: 'Mining paused — below break-even',
+            detail: `${snap.reason}. BTC/day ≈ ${snap.btc_per_day?.toFixed(5) ?? '?'}, energy ≈ $${snap.daily_energy_cost_usd.toFixed(2)}/day at ${snap.rate_cents_per_kwh.toFixed(1)}¢/kWh. Miners + fans will stay off until price recovers.`,
+            priority: 4,
+            tags: ['chart_with_downwards_trend', 'pause_button'],
+          });
+          clearAlertDedup('profit:recover');
+        }
+        return true;
+      }
+      console.log(
+        `[scheduler] profit guard: below ${label} for ${belowMin.toFixed(1)}/${cfg.pause_below_minutes}m — not tripping yet`
+      );
+    } else {
+      state.profitBelowSince = null;
+    }
+    return false;
+  }
+
+  // Currently tripped — decide whether to resume (require recovery margin).
+  const resumeAt = threshold * (1 + cfg.resume_margin_pct / 100);
+  if (price >= resumeAt) {
+    state.profitTripped = false;
+    state.profitBelowSince = null;
+    logEvent({
+      miner_id: null,
+      action: 'system',
+      source: 'profit:guard',
+      result: 'success',
+      detail: `Profit guard released: price $${Math.round(price).toLocaleString()} ≥ resume target $${Math.round(resumeAt).toLocaleString()}`,
+    });
+    if (cfg.notify_on_recover) {
+      await sendAlert({
+        key: 'profit:recover',
+        title: 'Mining resumed — price recovered',
+        detail: `BTC $${Math.round(price).toLocaleString()} is back above the ${label} (+${cfg.resume_margin_pct}% margin). Resuming miners + fans.`,
+        priority: 3,
+        tags: ['chart_with_upwards_trend', 'play_button'],
+      });
+      clearAlertDedup('profit:trip');
+    }
+    return false;
+  }
+  console.log(
+    `[scheduler] profit guard: tripped, price $${Math.round(price)} < resume target $${Math.round(resumeAt)} — staying paused`
+  );
+  return true;
+}
+
 export async function reconcile() {
   const miners = getEnabledMiners();
   const windows = getEnabledBlackouts();
   const plug = getPlugConfig();
 
   const now = new Date();
-  let anyShouldRun = false;
   const decisions = miners.map((m) => {
     const ev = evaluateForMiner(m.id, windows, now);
-    if (!ev.shouldPause) anyShouldRun = true;
     return { miner: m, shouldPause: ev.shouldPause, source: ev.activeWindows[0]?.label ?? 'manual' };
   });
+
+  // ── Profitability guard (rig-wide) ──
+  // Independent of the blackout schedule: if BTC price is below break-even
+  // (with hysteresis), force ALL miners to pause. Applied on top of the
+  // per-miner blackout decisions before we drive the plug, so the fans mirror
+  // the paused state too.
+  const profitPause = await evaluateProfitGuard(now);
+  if (profitPause) {
+    for (const d of decisions) {
+      d.shouldPause = true;
+      d.source = 'profit:below-breakeven';
+    }
+  }
+
+  const anyShouldRun = decisions.some((d) => !d.shouldPause);
   console.log(
     `[scheduler] reconcile: ${decisions.length} miners, anyShouldRun=${anyShouldRun}, decisions=${decisions
       .map((d) => `${d.miner.id}:${d.shouldPause ? 'P' : 'R'}`)
@@ -536,6 +685,8 @@ export function startScheduler() {
   state.startedAt = Date.now();
   state.unknownStateStreak = 0;
   state.stuckResumeStreak.clear();
+  state.profitBelowSince = null;
+  state.profitTripped = false;
   const settings = getSettings();
 
   // Poll loop

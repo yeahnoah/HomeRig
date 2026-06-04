@@ -58,22 +58,63 @@ interface ElectricityResponse {
   monthly?: MonthlySummary;
 }
 
+interface ProfitCfg {
+  enabled: boolean;
+  has_token: boolean;
+  price_source: string;
+  pause_below_minutes: number;
+  resume_margin_pct: number;
+  manual_floor_enabled: boolean;
+  manual_floor_usd: number;
+  running_watts_override: number;
+  notify_on_trip: boolean;
+  notify_on_recover: boolean;
+}
+
+interface ProfitSnapshot {
+  enabled: boolean;
+  btc_price_usd: number | null;
+  btc_per_day: number | null;
+  btc_per_day_method: string | null;
+  hashrate_ths: number;
+  running_watts: number;
+  rate_period: 'peak' | 'offpeak';
+  rate_cents_per_kwh: number;
+  daily_energy_cost_usd: number;
+  break_even_usd: number | null;
+  threshold_usd: number | null;
+  manual_floor_active: boolean;
+  revenue_per_day_usd: number | null;
+  profit_per_day_usd: number | null;
+  unprofitable: boolean;
+  reason: string;
+}
+
+interface ProfitResponse {
+  config: ProfitCfg;
+  snapshot: ProfitSnapshot;
+  guard: { tripped: boolean; below_for_seconds: number | null };
+}
+
 export default function SettingsPage() {
   const [view, setView] = useState<SettingsView | null>(null);
   const [miners, setMiners] = useState<SafeMiner[]>([]);
   const [electricity, setElectricity] = useState<ElectricityResponse | null>(null);
+  const [profit, setProfit] = useState<ProfitResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const [s, m, e] = await Promise.all([
+    const [s, m, e, p] = await Promise.all([
       fetch('/api/settings').then((r) => r.json()),
       fetch('/api/miners').then((r) => r.json()),
       fetch('/api/electricity').then((r) => r.json()),
+      fetch('/api/profitability').then((r) => r.json()),
     ]);
     setView(s);
     setMiners(m.miners ?? []);
     setElectricity(e ?? null);
+    setProfit(p ?? null);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -98,6 +139,10 @@ export default function SettingsPage() {
 
       {electricity && (
         <ElectricitySection electricity={electricity} onChange={refresh} setMsg={setMsg} />
+      )}
+
+      {profit && (
+        <ProfitabilitySection profit={profit} onChange={refresh} setMsg={setMsg} />
       )}
 
       <PollingSection settings={view.settings} onChange={refresh} setMsg={setMsg} />
@@ -685,6 +730,254 @@ function Stat({
       <div className="text-[10px] uppercase tracking-wider text-muted">{label}</div>
       <div className={`text-base data ${cls}`}>{value}</div>
     </div>
+  );
+}
+
+// ----- Profitability guard -----
+
+function ProfitabilitySection({
+  profit, onChange, setMsg,
+}: {
+  profit: ProfitResponse;
+  onChange: () => void;
+  setMsg: (s: string) => void;
+}) {
+  const c = profit.config;
+  const [enabled, setEnabled] = useState(c.enabled);
+  const [token, setToken] = useState('');
+  const [source, setSource] = useState(c.price_source);
+  const [pauseBelow, setPauseBelow] = useState(c.pause_below_minutes);
+  const [resumeMargin, setResumeMargin] = useState(c.resume_margin_pct);
+  const [manualEnabled, setManualEnabled] = useState(c.manual_floor_enabled);
+  const [manualUsd, setManualUsd] = useState(c.manual_floor_usd);
+  const [wattsOverride, setWattsOverride] = useState(c.running_watts_override);
+  const [notifyTrip, setNotifyTrip] = useState(c.notify_on_trip);
+  const [notifyRecover, setNotifyRecover] = useState(c.notify_on_recover);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  async function save() {
+    setSaving(true);
+    await fetch('/api/profitability', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled,
+        ...(token ? { pool_token: token } : {}),
+        price_source: source,
+        pause_below_minutes: pauseBelow,
+        resume_margin_pct: resumeMargin,
+        manual_floor_enabled: manualEnabled,
+        manual_floor_usd: manualUsd,
+        running_watts_override: wattsOverride,
+        notify_on_trip: notifyTrip,
+        notify_on_recover: notifyRecover,
+      }),
+    });
+    setToken('');
+    setSaving(false);
+    setMsg('Profitability guard saved');
+    onChange();
+  }
+
+  async function testToken() {
+    setTesting(true);
+    const r = await fetch('/api/profitability/test-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(token ? { token } : {}),
+    }).then((x) => x.json());
+    setTesting(false);
+    setMsg(
+      r.ok
+        ? `Pool OK — ${r.hashrate_ths?.toFixed(1) ?? '?'} TH/s, ${r.ok_workers ?? '?'} workers online`
+        : `Pool token failed: ${r.error}`
+    );
+  }
+
+  const s = profit.snapshot;
+  const tripped = profit.guard.tripped;
+  const fmtUsd = (n: number | null | undefined, dp = 0) =>
+    n == null ? '—' : `$${n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
+  // Status LED: red when tripped, amber when below-but-in-grace, green when healthy.
+  const belowGrace = !tripped && profit.guard.below_for_seconds != null;
+  const led = !enabled ? 'led--gray' : tripped ? 'led--red' : belowGrace ? 'led--amber' : 'led--green';
+  const statusLabel = !enabled
+    ? 'disabled'
+    : tripped
+    ? 'paused — unprofitable'
+    : belowGrace
+    ? 'below break-even (grace)'
+    : 'profitable';
+
+  return (
+    <section className="space-y-3">
+      <h2 className="font-medium">Profitability guard</h2>
+      <div className="rounded-lg border border-border bg-surface p-4 space-y-4">
+        <p className="text-xs text-muted leading-relaxed">
+          Pauses miners + fans when the live BTC price falls below break-even
+          (marginal energy cost ÷ BTC mined per day), and resumes when it recovers.
+          Uses the <strong>current marginal rate</strong> — demand and service charges are
+          excluded, since they don&apos;t change with a single on/off decision.
+        </p>
+
+        {/* ── Live status ── */}
+        <div className="rounded border border-border bg-surface-2 p-3 space-y-3">
+          <div className="flex items-center gap-3 text-sm">
+            <span className="text-[10px] uppercase tracking-wider text-muted">Status</span>
+            <span className={`led ${led}`} />
+            <span className="data uppercase tracking-wider text-xs">{statusLabel}</span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+            <Stat label="BTC price" value={fmtUsd(s.btc_price_usd)} />
+            <Stat
+              label="Break-even"
+              value={fmtUsd(s.threshold_usd)}
+              accent={s.unprofitable ? 'red' : 'plain'}
+            />
+            <Stat label="BTC / day" value={s.btc_per_day != null ? s.btc_per_day.toFixed(5) : '—'} />
+            <Stat
+              label="Profit / day"
+              value={fmtUsd(s.profit_per_day_usd, 2)}
+              accent={s.profit_per_day_usd != null && s.profit_per_day_usd < 0 ? 'red' : 'green'}
+            />
+            <Stat label="Revenue / day" value={fmtUsd(s.revenue_per_day_usd, 2)} />
+            <Stat label="Energy / day" value={fmtUsd(s.daily_energy_cost_usd, 2)} />
+            <Stat
+              label="Running power"
+              value={s.running_watts > 0 ? `${(s.running_watts / 1000).toFixed(2)} kW` : '—'}
+            />
+            <Stat
+              label="Rate now"
+              value={`${s.rate_cents_per_kwh.toFixed(2)}¢ ${s.rate_period === 'peak' ? '(peak)' : '(off-pk)'}`}
+            />
+          </div>
+          <p className="text-xs text-muted">
+            {s.reason}
+            {s.btc_per_day_method && (
+              <span className="text-muted/70"> · source: {s.btc_per_day_method.replace(/_/g, ' ')}</span>
+            )}
+          </p>
+        </div>
+
+        {/* ── Pool token ── */}
+        <div className="grid md:grid-cols-2 gap-3">
+          <Field label="Braiins Pool API token">
+            <Input
+              value={token}
+              onChange={setToken}
+              placeholder={c.has_token ? 'Saved — leave blank to keep' : 'paste pool access token'}
+              type="password"
+              className="data"
+            />
+          </Field>
+          <Field label="BTC price source">
+            <select
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+              className="w-full bg-surface-2 border border-border rounded px-3 py-2 text-sm data"
+            >
+              <option value="coinbase">Coinbase (default)</option>
+              <option value="kraken">Kraken</option>
+            </select>
+          </Field>
+        </div>
+        <p className="text-xs text-muted">
+          Generate a token in the Braiins Pool dashboard at{' '}
+          <span className="data">Settings → Access Profiles</span> (read access is enough).
+          Stored encrypted; never sent back to the browser.
+        </p>
+
+        {/* ── Hysteresis ── */}
+        <div className="space-y-2 pt-2 border-t border-border">
+          <div className="text-[10px] uppercase tracking-wider text-muted">Hysteresis (anti-flapping)</div>
+          <div className="grid md:grid-cols-2 gap-3">
+            <Field label="Pause after below for (min)">
+              <Input
+                value={String(pauseBelow)}
+                onChange={(v) => setPauseBelow(parseInt(v) || 0)}
+                className="data"
+              />
+            </Field>
+            <Field label="Resume margin above break-even (%)">
+              <Input
+                value={String(resumeMargin)}
+                onChange={(v) => setResumeMargin(parseFloat(v) || 0)}
+                className="data"
+              />
+            </Field>
+          </div>
+        </div>
+
+        {/* ── Manual floor + power override ── */}
+        <div className="space-y-2 pt-2 border-t border-border">
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={manualEnabled}
+              onChange={(e) => setManualEnabled(e.target.checked)}
+              className="mt-1"
+            />
+            <span>
+              <span className="block">Use a fixed price floor instead of dynamic break-even</span>
+              <span className="block text-xs text-muted">
+                When on, the guard trips below this $/BTC instead of the computed break-even.
+              </span>
+            </span>
+          </label>
+          <div className="grid md:grid-cols-2 gap-3">
+            <Field label="Manual floor ($/BTC)">
+              <Input
+                value={String(manualUsd)}
+                onChange={(v) => setManualUsd(parseFloat(v) || 0)}
+                className="data"
+              />
+            </Field>
+            <Field label="Running power override (W, 0 = auto)">
+              <Input
+                value={String(wattsOverride)}
+                onChange={(v) => setWattsOverride(parseInt(v) || 0)}
+                className="data"
+              />
+            </Field>
+          </div>
+          <p className="text-xs text-muted">
+            Power is auto-detected from recent mining history. Set an override only if you don&apos;t
+            yet have enough history (e.g. right after install) — e.g. <span className="data">6700</span> for two S21 XP + fans.
+          </p>
+        </div>
+
+        {/* ── Toggles + actions ── */}
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm pt-2 border-t border-border">
+          <label className="inline-flex items-center gap-2">
+            <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> Guard enabled
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input type="checkbox" checked={notifyTrip} onChange={(e) => setNotifyTrip(e.target.checked)} /> Notify on pause
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input type="checkbox" checked={notifyRecover} onChange={(e) => setNotifyRecover(e.target.checked)} /> Notify on resume
+          </label>
+        </div>
+
+        <div className="flex flex-wrap gap-2 justify-end">
+          <button
+            onClick={testToken}
+            disabled={testing || (!c.has_token && !token)}
+            className="text-xs px-3 py-1.5 rounded border border-border hover:border-accent-dim disabled:opacity-50"
+          >
+            {testing ? 'Testing…' : 'Test token'}
+          </button>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-black hover:bg-accent/90 disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }
 

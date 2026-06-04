@@ -71,6 +71,28 @@ interface ElectricityState {
   plug?: { power_w: number | null; energy_kwh: number | null; ts: string } | null;
 }
 
+interface ProfitState {
+  config: { enabled: boolean; has_token: boolean };
+  snapshot: {
+    enabled: boolean;
+    btc_price_usd: number | null;
+    btc_per_day: number | null;
+    btc_per_day_method: string | null;
+    running_watts: number;
+    rate_period: 'peak' | 'offpeak';
+    rate_cents_per_kwh: number;
+    daily_energy_cost_usd: number;
+    break_even_usd: number | null;
+    threshold_usd: number | null;
+    manual_floor_active: boolean;
+    revenue_per_day_usd: number | null;
+    profit_per_day_usd: number | null;
+    unprofitable: boolean;
+    reason: string;
+  };
+  guard: { tripped: boolean; below_for_seconds: number | null };
+}
+
 const WINDOW_OPTIONS = [
   { label: '15m', minutes: 15 },
   { label: '1h', minutes: 60 },
@@ -82,20 +104,23 @@ export default function Dashboard() {
   const [miners, setMiners] = useState<MinerRow[]>([]);
   const [history, setHistory] = useState<HistorySeries[]>([]);
   const [electricity, setElectricity] = useState<ElectricityState | null>(null);
+  const [profit, setProfit] = useState<ProfitState | null>(null);
   const [windowMinutes, setWindowMinutes] = useState(60);
   const [refreshing, setRefreshing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [m, h, e] = await Promise.all([
+      const [m, h, e, p] = await Promise.all([
         fetch('/api/miners').then((r) => r.json()),
         fetch(`/api/miners/history?minutes=${windowMinutes}`).then((r) => r.json()),
         fetch('/api/electricity').then((r) => r.json()),
+        fetch('/api/profitability').then((r) => r.json()),
       ]);
       setMiners(m.miners ?? []);
       setHistory(h.series ?? []);
       setElectricity(e ?? null);
+      setProfit(p ?? null);
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -282,6 +307,9 @@ export default function Dashboard() {
       {electricity?.monthly && (
         <MonthlyBillCard monthly={electricity.monthly} demandRate={electricity.config.demand_charge_dollars_per_kw} />
       )}
+
+      {/* ── Profitability guard ── */}
+      {profit?.snapshot.enabled && <ProfitabilityCard profit={profit} />}
 
       {/* ── Charts row ── */}
       <section className="grid lg:grid-cols-3 gap-4">
@@ -509,6 +537,83 @@ function MonthlyBillCard({ monthly, demandRate }: { monthly: MonthlySummary; dem
           accent="amber"
         />
       </div>
+    </section>
+  );
+}
+
+/**
+ * Profitability guard card. Shows the live break-even math and the guard's
+ * current state (profitable / in-grace / paused). Only rendered when the guard
+ * is enabled in settings.
+ */
+function ProfitabilityCard({ profit }: { profit: ProfitState }) {
+  const s = profit.snapshot;
+  const tripped = profit.guard.tripped;
+  const belowGrace = !tripped && profit.guard.below_for_seconds != null;
+
+  const fmtUsd = (n: number | null | undefined, dp = 0) =>
+    n == null
+      ? '—'
+      : `$${n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
+
+  const status = tripped
+    ? { label: 'Paused — unprofitable', led: 'led--red', text: 'text-red' }
+    : belowGrace
+    ? { label: 'Below break-even (grace)', led: 'led--amber', text: 'text-accent' }
+    : { label: 'Profitable', led: 'led--green', text: 'text-green' };
+
+  const thresholdLabel = s.manual_floor_active ? 'Floor (manual)' : 'Break-even';
+  const profitAccent = s.profit_per_day_usd != null && s.profit_per_day_usd < 0 ? 'red' : 'green';
+
+  return (
+    <section className="rounded-lg border border-border bg-surface p-5 space-y-4 fade-up">
+      <header className="flex items-baseline justify-between gap-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className={`led ${status.led}`} />
+          <h3 className="text-sm font-medium">Profitability</h3>
+          <span className={`text-[10px] uppercase tracking-[0.18em] ${status.text}`}>{status.label}</span>
+        </div>
+        <div className="flex items-baseline gap-2">
+          <span className="text-2xl data text-foreground">{fmtUsd(s.btc_price_usd)}</span>
+          <span className="text-xs text-muted">BTC now</span>
+          <span className="text-muted">·</span>
+          <span className={`text-2xl data ${s.unprofitable ? 'text-red' : 'text-accent'}`}>
+            {fmtUsd(s.threshold_usd)}
+          </span>
+          <span className="text-xs text-muted">{s.manual_floor_active ? 'floor' : 'break-even'}</span>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <BillLine
+          label={thresholdLabel}
+          amount={fmtUsd(s.threshold_usd)}
+          sub={
+            s.running_watts > 0
+              ? `${(s.running_watts / 1000).toFixed(2)} kW @ ${s.rate_cents_per_kwh.toFixed(2)}¢`
+              : 'no power data yet'
+          }
+          accent={s.unprofitable ? 'red' : 'plain'}
+        />
+        <BillLine
+          label="BTC / day"
+          amount={s.btc_per_day != null ? s.btc_per_day.toFixed(5) : '—'}
+          sub={s.btc_per_day_method ? s.btc_per_day_method.replace(/_/g, ' ') : 'pool unreachable'}
+        />
+        <BillLine
+          label="Revenue / day"
+          amount={fmtUsd(s.revenue_per_day_usd, 2)}
+          sub={`energy ${fmtUsd(s.daily_energy_cost_usd, 2)}`}
+        />
+        <BillLine
+          label="Profit / day"
+          amount={fmtUsd(s.profit_per_day_usd, 2)}
+          sub={s.rate_period === 'peak' ? 'peak rate' : 'off-peak rate'}
+          accent={profitAccent}
+        />
+      </div>
+
+      <p className="text-[11px] text-muted data">{s.reason}</p>
     </section>
   );
 }

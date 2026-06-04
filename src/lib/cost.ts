@@ -259,6 +259,55 @@ export function getSpendSummary(windowMinutes: number = 24 * 60): SpendSummary {
   };
 }
 
+// ─── Typical running power ───────────────────────────────────────────────────
+//
+// The profitability guard needs the rig's power draw WHEN RUNNING, not the
+// instantaneous draw (which is ~0 while paused). We average recent samples that
+// look like active mining (per miner) plus the plug's active draw. This answers
+// "if the rig runs, what does it cost?" — the right basis for a go/no-go call.
+
+/** Per-miner "running" threshold in watts; below this we treat the miner as paused/idle. */
+const RUNNING_MINER_THRESHOLD_W = 500;
+/** Plug "on" threshold in watts. */
+const RUNNING_PLUG_THRESHOLD_W = 5;
+
+/**
+ * Estimate the rig's total running power in watts (miners + plug). If
+ * `overrideW > 0`, returns that directly. Otherwise averages active samples
+ * from the last `lookbackMinutes`. Returns 0 when there's no running history —
+ * callers treat 0 as "unknown" and fail safe (don't pause on profitability).
+ */
+export function getTypicalRunningPowerW(overrideW = 0, lookbackMinutes = 180): number {
+  if (overrideW > 0) return overrideW;
+
+  const rows = getStatsHistory({ minutes: lookbackMinutes });
+  const byMiner = new Map<number, { sum: number; count: number }>();
+  for (const r of rows) {
+    if (r.power_w == null || r.power_w < RUNNING_MINER_THRESHOLD_W) continue;
+    let m = byMiner.get(r.miner_id);
+    if (!m) {
+      m = { sum: 0, count: 0 };
+      byMiner.set(r.miner_id, m);
+    }
+    m.sum += r.power_w;
+    m.count += 1;
+  }
+  let minerW = 0;
+  for (const m of byMiner.values()) if (m.count > 0) minerW += m.sum / m.count;
+
+  const plugRows = getPlugHistory({ minutes: lookbackMinutes });
+  let plugSum = 0;
+  let plugCount = 0;
+  for (const r of plugRows) {
+    if (r.plug_power_w == null || r.plug_power_w < RUNNING_PLUG_THRESHOLD_W) continue;
+    plugSum += r.plug_power_w;
+    plugCount += 1;
+  }
+  const plugW = plugCount > 0 ? plugSum / plugCount : 0;
+
+  return minerW + plugW;
+}
+
 // ─── Monthly demand peak ─────────────────────────────────────────────────────
 //
 // Georgia Power TOU-RD bills demand based on the highest 60-minute average kW

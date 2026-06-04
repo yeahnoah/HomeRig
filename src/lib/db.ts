@@ -9,6 +9,7 @@ import type {
   BlackoutInput,
   TimeRange,
   PlugConfig,
+  ProfitConfig,
   EventLogEntry,
   AppSettings,
 } from '@/types';
@@ -198,6 +199,22 @@ function initSchema(d: Database.Database) {
       plug_energy_kwh REAL
     );
     CREATE INDEX IF NOT EXISTS idx_plug_history_ts ON plug_history (ts DESC);
+
+    -- Profitability guard config. Singleton row (id=1). When enabled, the
+    -- scheduler pauses the rig when live BTC price < break-even, with hysteresis.
+    CREATE TABLE IF NOT EXISTS profit_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      enabled INTEGER NOT NULL DEFAULT 0,
+      pool_token_encrypted TEXT NOT NULL DEFAULT '',
+      price_source TEXT NOT NULL DEFAULT 'coinbase',
+      pause_below_minutes INTEGER NOT NULL DEFAULT 15,
+      resume_margin_pct REAL NOT NULL DEFAULT 5,
+      manual_floor_enabled INTEGER NOT NULL DEFAULT 0,
+      manual_floor_usd REAL NOT NULL DEFAULT 0,
+      running_watts_override INTEGER NOT NULL DEFAULT 0,
+      notify_on_trip INTEGER NOT NULL DEFAULT 1,
+      notify_on_recover INTEGER NOT NULL DEFAULT 1
+    );
   `);
 }
 
@@ -222,6 +239,16 @@ export function seedIfEmpty() {
                                 startup_stagger_enabled, startup_stagger_seconds,
                                 notify_on_miner_pause, notify_on_miner_resume)
        VALUES (1, 0, 1, '', '', '', 1, '', 0, 1, 30, 1, 1)`
+    ).run();
+  }
+  const profit = d.prepare('SELECT COUNT(*) AS n FROM profit_config').get() as { n: number };
+  if (profit.n === 0) {
+    d.prepare(
+      `INSERT INTO profit_config (id, enabled, pool_token_encrypted, price_source,
+                                  pause_below_minutes, resume_margin_pct,
+                                  manual_floor_enabled, manual_floor_usd,
+                                  running_watts_override, notify_on_trip, notify_on_recover)
+       VALUES (1, 0, '', 'coinbase', 15, 5, 0, 0, 0, 1, 1)`
     ).run();
   }
   const settingsRow = d.prepare('SELECT COUNT(*) AS n FROM settings').get() as { n: number };
@@ -464,6 +491,60 @@ export function updatePlugConfig(patch: PlugConfigPatch): PlugConfig {
   return getPlugConfig();
 }
 
+// ----- profitability config -----
+
+export function getProfitConfig(): ProfitConfig {
+  return getDb().prepare('SELECT * FROM profit_config WHERE id = 1').get() as ProfitConfig;
+}
+
+export interface ProfitConfigPatch {
+  enabled?: boolean | 0 | 1;
+  /** Plaintext token; encrypted at rest before persistence. Empty string clears it. */
+  pool_token?: string;
+  price_source?: string;
+  pause_below_minutes?: number;
+  resume_margin_pct?: number;
+  manual_floor_enabled?: boolean | 0 | 1;
+  manual_floor_usd?: number;
+  running_watts_override?: number;
+  notify_on_trip?: boolean | 0 | 1;
+  notify_on_recover?: boolean | 0 | 1;
+}
+
+export function updateProfitConfig(patch: ProfitConfigPatch): ProfitConfig {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  const setField = (k: string, v: unknown) => {
+    fields.push(`${k} = ?`);
+    values.push(v);
+  };
+  if (patch.enabled !== undefined) setField('enabled', patch.enabled ? 1 : 0);
+  if (patch.pool_token !== undefined) {
+    // Non-empty → encrypt + store. Empty string → explicitly clear the token.
+    setField('pool_token_encrypted', patch.pool_token ? encrypt(patch.pool_token) : '');
+  }
+  if (patch.price_source !== undefined) setField('price_source', patch.price_source);
+  if (patch.pause_below_minutes !== undefined)
+    setField('pause_below_minutes', Math.max(0, Math.round(patch.pause_below_minutes)));
+  if (patch.resume_margin_pct !== undefined)
+    setField('resume_margin_pct', Math.max(0, patch.resume_margin_pct));
+  if (patch.manual_floor_enabled !== undefined)
+    setField('manual_floor_enabled', patch.manual_floor_enabled ? 1 : 0);
+  if (patch.manual_floor_usd !== undefined)
+    setField('manual_floor_usd', Math.max(0, patch.manual_floor_usd));
+  if (patch.running_watts_override !== undefined)
+    setField('running_watts_override', Math.max(0, Math.round(patch.running_watts_override)));
+  if (patch.notify_on_trip !== undefined) setField('notify_on_trip', patch.notify_on_trip ? 1 : 0);
+  if (patch.notify_on_recover !== undefined)
+    setField('notify_on_recover', patch.notify_on_recover ? 1 : 0);
+  if (fields.length === 0) return getProfitConfig();
+  values.push(1);
+  getDb()
+    .prepare(`UPDATE profit_config SET ${fields.join(', ')} WHERE id = ?`)
+    .run(...values);
+  return getProfitConfig();
+}
+
 // ----- event log -----
 
 export function logEvent(entry: Omit<EventLogEntry, 'id' | 'ts'>) {
@@ -550,11 +631,17 @@ export function insertStatsHistory(row: {
     .run(row.miner_id, row.hashrate_th, row.power_w, row.max_chip_temp, row.status);
 }
 
+// Upper bound on how far back a single history query may reach. Sized to cover
+// a full billing month (31 days) plus buffer, because getMonthlySummary()
+// integrates energy and finds the demand peak across the whole month-to-date.
+// A tighter cap (e.g. 7 days) would silently truncate the monthly numbers.
+const MAX_HISTORY_MINUTES = 40 * 24 * 60;
+
 export function getStatsHistory(opts: {
   miner_id?: number;
   minutes?: number;
 }): StatsHistoryRow[] {
-  const minutes = Math.max(1, Math.min(opts.minutes ?? 60, 7 * 24 * 60));
+  const minutes = Math.max(1, Math.min(opts.minutes ?? 60, MAX_HISTORY_MINUTES));
   const params: unknown[] = [`-${minutes} minutes`];
   let sql = `SELECT * FROM stats_history WHERE ts >= datetime('now', ?)`;
   if (opts.miner_id !== undefined) {
@@ -565,8 +652,12 @@ export function getStatsHistory(opts: {
   return getDb().prepare(sql).all(...params) as StatsHistoryRow[];
 }
 
-/** Delete rows older than `retainHours`. Cheap to run periodically. */
-export function pruneStatsHistory(retainHours: number = 7 * 24) {
+/**
+ * Delete rows older than `retainHours`. Cheap to run periodically.
+ * Default retains 40 days so a full billing month (used by getMonthlySummary)
+ * is always available — pruning at 7 days would corrupt monthly cost/demand.
+ */
+export function pruneStatsHistory(retainHours: number = 40 * 24) {
   getDb()
     .prepare(`DELETE FROM stats_history WHERE ts < datetime('now', ?)`)
     .run(`-${retainHours} hours`);
@@ -592,7 +683,7 @@ export function insertPlugHistory(row: {
 
 /** All plug history rows within the window (UTC SQLite time). */
 export function getPlugHistory(opts: { minutes?: number }): PlugHistoryRow[] {
-  const minutes = Math.max(1, Math.min(opts.minutes ?? 60, 7 * 24 * 60));
+  const minutes = Math.max(1, Math.min(opts.minutes ?? 60, MAX_HISTORY_MINUTES));
   return getDb()
     .prepare(`SELECT * FROM plug_history WHERE ts >= datetime('now', ?) ORDER BY ts ASC`)
     .all(`-${minutes} minutes`) as PlugHistoryRow[];
@@ -612,7 +703,7 @@ export function getLatestPlugHistory(): PlugHistoryRow | undefined {
     .get() as PlugHistoryRow | undefined;
 }
 
-export function prunePlugHistory(retainHours: number = 30 * 24) {
+export function prunePlugHistory(retainHours: number = 40 * 24) {
   getDb()
     .prepare(`DELETE FROM plug_history WHERE ts < datetime('now', ?)`)
     .run(`-${retainHours} hours`);
