@@ -24,7 +24,7 @@
 
 import { getProfitConfig } from './db';
 import { decrypt } from './crypto';
-import { currentRatePeriod, currentRateCentsPerKwh, getTypicalRunningPowerW } from './cost';
+import { getElectricityConfig, getTypicalRunningPowerW, type RatePeriod } from './cost';
 import { getBtcPerDay } from './braiins-pool';
 import { getBtcPriceUsd, type PriceSource } from './btc-price';
 
@@ -115,8 +115,14 @@ export async function evaluateProfitability(now: Date = new Date()): Promise<Pro
   ]);
 
   const runningWatts = getTypicalRunningPowerW(cfg.running_watts_override);
-  const ratePeriod = currentRatePeriod(now);
-  const rateCents = currentRateCentsPerKwh(now);
+  // Break-even is pinned to the OFF-PEAK rate: the miners only ever run during
+  // off-peak hours (the blackout schedule pauses them during peak windows), so
+  // off-peak is the marginal cost during the hours mining actually happens.
+  // Using the live current rate would inflate break-even during a blackout/peak
+  // window — when the miners are already paused and the guard is moot anyway.
+  const elec = getElectricityConfig();
+  const ratePeriod: RatePeriod = 'offpeak';
+  const rateCents = elec.rate_offpeak_cents;
   const dailyEnergyCost = (runningWatts / 1000) * (rateCents / 100) * 24;
 
   const btcPerDay = perDay?.btc_per_day ?? null;
