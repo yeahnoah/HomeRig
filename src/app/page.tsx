@@ -5,6 +5,7 @@ import { HeroStat } from '@/components/dashboard/hero-stat';
 import { HashrateChart, PowerCostChart, Sparkline, type ChartPoint } from '@/components/dashboard/charts';
 import { CostPopover } from '@/components/dashboard/cost-popover';
 import { BoardStrip } from '@/components/dashboard/board-strip';
+import { ProjectionSection, EfficiencySection, type ModelSeed } from '@/components/dashboard/projection';
 import type { MinerStats } from '@/types';
 
 interface MinerRow {
@@ -105,22 +106,25 @@ export default function Dashboard() {
   const [history, setHistory] = useState<HistorySeries[]>([]);
   const [electricity, setElectricity] = useState<ElectricityState | null>(null);
   const [profit, setProfit] = useState<ProfitState | null>(null);
+  const [model, setModel] = useState<ModelSeed | null>(null);
   const [windowMinutes, setWindowMinutes] = useState(60);
   const [refreshing, setRefreshing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [m, h, e, p] = await Promise.all([
+      const [m, h, e, p, mo] = await Promise.all([
         fetch('/api/miners').then((r) => r.json()),
         fetch(`/api/miners/history?minutes=${windowMinutes}`).then((r) => r.json()),
         fetch('/api/electricity').then((r) => r.json()),
         fetch('/api/profitability').then((r) => r.json()),
+        fetch('/api/mining/model').then((r) => r.json()),
       ]);
       setMiners(m.miners ?? []);
       setHistory(h.series ?? []);
       setElectricity(e ?? null);
       setProfit(p ?? null);
+      setModel(mo ?? null);
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -310,6 +314,12 @@ export default function Dashboard() {
 
       {/* ── Profitability guard ── */}
       {profit?.snapshot.enabled && <ProfitabilityCard profit={profit} />}
+
+      {/* ── Live efficiency (J/TH) ── */}
+      {model && <EfficiencySection seed={model} />}
+
+      {/* ── Profitability projection calculator ── */}
+      {model && <ProjectionSection seed={model} />}
 
       {/* ── Charts row ── */}
       <section className="grid lg:grid-cols-3 gap-4">

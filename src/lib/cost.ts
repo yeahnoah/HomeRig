@@ -361,6 +361,51 @@ export function getTypicalRunningPowerW(overrideW = 0, lookbackMinutes = 180): n
   return minerW + plugW;
 }
 
+// ─── Live mining efficiency (J/TH) ───────────────────────────────────────────
+//
+// Energy efficiency = power (W) / hashrate (TH/s) = J/TH. Computed from recent
+// samples where the miner was actually hashing (hashrate > 0 and power above the
+// running threshold), so spin-up/paused transients don't skew it.
+
+export interface LiveEfficiency {
+  /** Combined running hashrate, TH/s. */
+  hashrate_ths: number;
+  /** Combined running power, W. */
+  power_w: number;
+  /** Efficiency in J/TH (= W per TH/s). 0 if not enough data. */
+  jth: number;
+  /** Number of miners contributing running samples. */
+  miner_count: number;
+}
+
+export function getLiveEfficiency(lookbackMinutes = 180): LiveEfficiency {
+  const rows = getStatsHistory({ minutes: lookbackMinutes });
+  // Per miner: average power and hashrate over "running" samples.
+  const byMiner = new Map<number, { pSum: number; hSum: number; n: number }>();
+  for (const r of rows) {
+    if (r.power_w == null || r.power_w < RUNNING_MINER_THRESHOLD_W) continue;
+    if (!r.hashrate_th || r.hashrate_th <= 0) continue;
+    let m = byMiner.get(r.miner_id);
+    if (!m) {
+      m = { pSum: 0, hSum: 0, n: 0 };
+      byMiner.set(r.miner_id, m);
+    }
+    m.pSum += r.power_w;
+    m.hSum += r.hashrate_th;
+    m.n += 1;
+  }
+  let power = 0;
+  let hashrate = 0;
+  for (const m of byMiner.values()) {
+    if (m.n > 0) {
+      power += m.pSum / m.n;
+      hashrate += m.hSum / m.n;
+    }
+  }
+  const jth = hashrate > 0 ? power / hashrate : 0;
+  return { hashrate_ths: hashrate, power_w: power, jth, miner_count: byMiner.size };
+}
+
 // ─── Monthly demand peak ─────────────────────────────────────────────────────
 //
 // Georgia Power TOU-RD bills demand based on the highest 60-minute average kW
