@@ -33,7 +33,12 @@
  */
 
 import { getProfitConfig } from './db';
-import { getElectricityConfig, getLiveEfficiency, type RatePeriod } from './cost';
+import {
+  getElectricityConfig,
+  getLiveEfficiency,
+  getTypicalRunningPowerW,
+  type RatePeriod,
+} from './cost';
 import { getBtcPriceUsd, type PriceSource } from './btc-price';
 import { getNetworkStats, expectedBtcPerDay } from './btc-network';
 
@@ -95,11 +100,11 @@ function disabledSnapshot(reason: string, enabled: boolean): ProfitSnapshot {
   };
 }
 
-/** Nameplate fallback for 2× Antminer S21 XP, used only if there's no recent
- *  running history at all (e.g. fresh install). Keeps the guard stable rather
- *  than blind. running_watts_override (if set) takes priority over both. */
+/** Nameplate fallback for 2× Antminer S21 XP + cooling fans, used only if
+ *  there's no recent running history at all (e.g. fresh install). Keeps the
+ *  guard stable rather than blind. running_watts_override (if set) wins. */
 const NAMEPLATE_THS = 540;
-const NAMEPLATE_WATTS = 7290;
+const NAMEPLATE_WATTS = 7290 + 250; // ~7290W miners + ~250W cooling fans
 
 /**
  * Compute the current profitability snapshot. Async (network + price, both
@@ -120,16 +125,22 @@ export async function evaluateProfitability(now: Date = new Date()): Promise<Pro
   const ratePeriod: RatePeriod = 'offpeak';
   const rateCents = elec.rate_offpeak_cents;
 
-  // Rig productivity inputs — averaged over RUNNING samples in the last 24h, so
+  // Rig productivity + power — averaged over RUNNING samples in the last 24h, so
   // they reflect full-runtime values and stay stable even if the rig is paused
-  // part of the day. Override > recent-running > nameplate.
+  // part of the day.
+  //   - hashrate: miners only (for expected productivity).
+  //   - power: miners + FANS. getTypicalRunningPowerW sums the miner draw and the
+  //     fan plug, because the fans are a real cost of running and belong in the
+  //     break-even just like the miners.
+  // Priority for power: override > recent-running(miners+fans) > nameplate.
   const eff = getLiveEfficiency(24 * 60);
   const hashrateThs = eff.hashrate_ths > 0 ? eff.hashrate_ths : NAMEPLATE_THS;
+  const measuredWatts = getTypicalRunningPowerW(0, 24 * 60); // miners + fans
   const runningWatts =
     cfg.running_watts_override > 0
       ? cfg.running_watts_override
-      : eff.power_w > 0
-        ? eff.power_w
+      : measuredWatts > 0
+        ? measuredWatts
         : NAMEPLATE_WATTS;
 
   // EXPECTED BTC/day at full runtime = rig's share of the live network. Stable;
