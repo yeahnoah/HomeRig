@@ -4,45 +4,49 @@
  * Answers: "at the current BTC price, does running the rig earn more than the
  * marginal energy it burns?" The break-even price is:
  *
- *     break_even_$ = daily_marginal_energy_cost ÷ BTC_mined_per_day
+ *     break_even_$ = daily_energy_cost ÷ EXPECTED_BTC_per_day
  *
- * where daily_marginal_energy_cost = running_kW × current_marginal_rate × 24h.
+ * where both are at FULL (24h) runtime:
+ *     daily_energy_cost   = running_kW × off-peak_rate × 24h
+ *     expected_BTC_per_day = (rig_hashrate ÷ network_hashrate) × 144 × subsidy
  *
- * Notes on the model:
- *   - MARGINAL cost only. We use the per-kWh rate in effect right now (off-peak
- *     vs peak), NOT the demand/service charges. Those are largely fixed for the
- *     month, so the "should we run right now?" decision shouldn't include them.
- *   - Time-of-use aware: break-even is naturally higher during peak hours
- *     because the marginal rate is higher. Re-evaluated every tick.
- *   - FAIL SAFE: if we can't get the price or BTC/day, `unprofitable` is false
- *     (never pause the rig on missing data). The scheduler also resets its
- *     hysteresis timer in that case.
+ * Why EXPECTED productivity, not the pool's measured reward:
+ *   The pool's recent daily reward collapses whenever the rig is paused (by a
+ *   blackout or the guard itself). Dividing energy by a suppressed reward made
+ *   break-even spike (e.g. to $100k) and trip again — a slow death spiral where
+ *   the guard's own pausing fed back into its threshold. Expected productivity
+ *   is derived from the rig's share of the LIVE NETWORK and does not depend on
+ *   whether we're currently running, so break-even is stable: it only moves with
+ *   network hashrate, the BTC subsidy, the electricity rate, and the rig's own
+ *   efficiency. Both numerator and denominator are full-runtime, so runtime
+ *   cancels and the result is a clean marginal break-even.
+ *
+ * Notes:
+ *   - MARGINAL cost only — the off-peak per-kWh rate (miners run off-peak), not
+ *     demand/service charges.
+ *   - FAIL SAFE: if price, network stats, or rig data are missing, `unprofitable`
+ *     is false (never pause on missing data). The scheduler resets hysteresis.
+ *   - The Braiins Pool token is no longer required for the dynamic break-even.
  *
  * This module is pure economics — it does NOT decide to pause. Hysteresis and
  * the actual pause/resume live in the scheduler, which owns the guard state.
  */
 
 import { getProfitConfig } from './db';
-import { decrypt } from './crypto';
-import {
-  getElectricityConfig,
-  getSpendSummary,
-  getTypicalRunningPowerW,
-  type RatePeriod,
-} from './cost';
-import { getBtcPerDay } from './braiins-pool';
+import { getElectricityConfig, getLiveEfficiency, type RatePeriod } from './cost';
 import { getBtcPriceUsd, type PriceSource } from './btc-price';
+import { getNetworkStats, expectedBtcPerDay } from './btc-network';
 
 export interface ProfitSnapshot {
   /** Whether the guard is enabled in config. */
   enabled: boolean;
   /** Live BTC/USD spot, or null if unavailable. */
   btc_price_usd: number | null;
-  /** Estimated BTC mined per day, or null if the pool is unreachable/unconfigured. */
+  /** EXPECTED BTC mined per day at full runtime (rig share of the live network). */
   btc_per_day: number | null;
-  /** How btc_per_day was derived (for transparency in the UI). */
+  /** How btc_per_day was derived (e.g. "network (mempool)"). */
   btc_per_day_method: string | null;
-  /** Trailing-24h pool hashrate in TH/s (0 if unknown). */
+  /** Rig hashrate used for the math, in TH/s (0 if unknown). */
   hashrate_ths: number;
   /** Rig running power used for the math, in watts. */
   running_watts: number;
@@ -91,90 +95,72 @@ function disabledSnapshot(reason: string, enabled: boolean): ProfitSnapshot {
   };
 }
 
+/** Nameplate fallback for 2× Antminer S21 XP, used only if there's no recent
+ *  running history at all (e.g. fresh install). Keeps the guard stable rather
+ *  than blind. running_watts_override (if set) takes priority over both. */
+const NAMEPLATE_THS = 540;
+const NAMEPLATE_WATTS = 7290;
+
 /**
- * Compute the current profitability snapshot. Async (network: pool + price).
- * Both calls are internally cached, so this is cheap to call every tick.
+ * Compute the current profitability snapshot. Async (network + price, both
+ * cached), so it's cheap to call every tick.
  */
 export async function evaluateProfitability(now: Date = new Date()): Promise<ProfitSnapshot> {
+  void now;
   const cfg = getProfitConfig();
   if (!cfg.enabled) return disabledSnapshot('Profitability guard disabled', false);
 
-  let token = '';
-  try {
-    token = cfg.pool_token_encrypted ? decrypt(cfg.pool_token_encrypted) : '';
-  } catch {
-    token = '';
-  }
-  // A manual price floor is a pure price-vs-threshold decision — it needs no
-  // pool data. The dynamic break-even path does require the pool token.
   const manualActive = cfg.manual_floor_enabled === 1 && cfg.manual_floor_usd > 0;
-  if (!token && !manualActive) return disabledSnapshot('No Braiins Pool token configured', true);
-
   const source = (cfg.price_source === 'kraken' ? 'kraken' : 'coinbase') as PriceSource;
 
-  // Fetch economics inputs in parallel (both cached internally). Skip the pool
-  // call entirely when running on a manual floor with no token.
-  const [perDay, price] = await Promise.all([
-    token ? getBtcPerDay(token, now) : Promise.resolve(null),
-    getBtcPriceUsd(source),
-  ]);
+  // Live price + network stats (both cached internally).
+  const [price, net] = await Promise.all([getBtcPriceUsd(source), getNetworkStats()]);
 
-  // Break-even is pinned to the OFF-PEAK rate: the miners only ever run during
-  // off-peak hours (the blackout schedule pauses them during peak windows), so
-  // off-peak is the marginal cost during the hours mining actually happens.
   const elec = getElectricityConfig();
   const ratePeriod: RatePeriod = 'offpeak';
   const rateCents = elec.rate_offpeak_cents;
 
-  // Energy basis: the ACTUAL measured kWh over the last 24h, priced at off-peak.
-  // Using the integral (not instantaneous power × 24h) is critical for two
-  // reasons:
-  //   1. It self-accounts for runtime — paused/blackout hours contribute no kWh,
-  //      so it stays on the SAME calendar-day basis as the pool's daily reward
-  //      (which is also earned over a partial day). Mixing a 24h energy cost with
-  //      a partial-day reward would inflate break-even and make a profitable rig
-  //      look unprofitable.
-  //   2. It doesn't read 0 just because the rig happens to be paused right now
-  //      (the old instantaneous detector returned 0 during every blackout).
-  // A manual override means "assume continuous operation at this power" — the
-  // escape hatch for a fresh install with no history yet.
-  let runningWatts: number;
-  let dailyKwh: number;
-  if (cfg.running_watts_override > 0) {
-    runningWatts = cfg.running_watts_override;
-    dailyKwh = (runningWatts / 1000) * 24;
-  } else {
-    const spend = getSpendSummary(24 * 60);
-    dailyKwh = spend.miner_kwh + spend.plug_kwh;
-    // Display-only: typical draw while actually running (24h lookback so it's
-    // populated even during a blackout).
-    runningWatts = getTypicalRunningPowerW(0, 24 * 60);
-  }
-  const dailyEnergyCost = dailyKwh * (rateCents / 100);
+  // Rig productivity inputs — averaged over RUNNING samples in the last 24h, so
+  // they reflect full-runtime values and stay stable even if the rig is paused
+  // part of the day. Override > recent-running > nameplate.
+  const eff = getLiveEfficiency(24 * 60);
+  const hashrateThs = eff.hashrate_ths > 0 ? eff.hashrate_ths : NAMEPLATE_THS;
+  const runningWatts =
+    cfg.running_watts_override > 0
+      ? cfg.running_watts_override
+      : eff.power_w > 0
+        ? eff.power_w
+        : NAMEPLATE_WATTS;
 
-  const btcPerDay = perDay?.btc_per_day ?? null;
-  const breakEven = btcPerDay != null && btcPerDay > 0 ? dailyEnergyCost / btcPerDay : null;
+  // EXPECTED BTC/day at full runtime = rig's share of the live network. Stable;
+  // does NOT collapse when the rig is paused, so the guard can't spiral.
+  const expectedBtcDay =
+    net && net.network_ths > 0 ? expectedBtcPerDay(hashrateThs, net.network_ths) : null;
+
+  // Cost + break-even, both at full (24h) runtime → runtime cancels → stable.
+  const dailyEnergyCost = (runningWatts / 1000) * 24 * (rateCents / 100);
+  const breakEven =
+    expectedBtcDay != null && expectedBtcDay > 0 ? dailyEnergyCost / expectedBtcDay : null;
 
   const threshold = manualActive ? cfg.manual_floor_usd : breakEven;
 
-  const revenuePerDay = btcPerDay != null && price != null ? btcPerDay * price : null;
+  const revenuePerDay = expectedBtcDay != null && price != null ? expectedBtcDay * price : null;
   const profitPerDay = revenuePerDay != null ? revenuePerDay - dailyEnergyCost : null;
 
-  // Can we make a real decision? The manual floor needs only a price; the
-  // dynamic break-even also needs measured energy (to compute the cost).
-  const evaluable = price != null && threshold != null && (manualActive || dailyKwh > 0);
+  // Can we make a real decision? Manual floor needs only a price; the dynamic
+  // break-even also needs network stats (to compute expected productivity).
+  const evaluable =
+    price != null && threshold != null && (manualActive || (expectedBtcDay != null && expectedBtcDay > 0));
 
   // Determine raw unprofitability + reason. Fail safe on any missing input.
   let unprofitable = false;
   let reason: string;
   if (price == null) {
     reason = 'BTC price unavailable — guard idle (fail safe)';
+  } else if (!manualActive && (net == null || expectedBtcDay == null)) {
+    reason = 'Network data unavailable — guard idle (fail safe)';
   } else if (threshold == null) {
-    reason = manualActive
-      ? 'Manual floor not set — guard idle'
-      : 'BTC/day unavailable — guard idle (fail safe)';
-  } else if (!manualActive && dailyKwh <= 0) {
-    reason = 'No energy history yet — guard idle (fail safe)';
+    reason = 'Manual floor not set — guard idle';
   } else {
     unprofitable = price < threshold;
     const label = manualActive ? 'manual floor' : 'break-even';
@@ -186,9 +172,9 @@ export async function evaluateProfitability(now: Date = new Date()): Promise<Pro
   return {
     enabled: true,
     btc_price_usd: price,
-    btc_per_day: btcPerDay,
-    btc_per_day_method: perDay?.method ?? null,
-    hashrate_ths: perDay?.hashrate_ths ?? 0,
+    btc_per_day: expectedBtcDay,
+    btc_per_day_method: net ? `network (${net.source})` : null,
+    hashrate_ths: hashrateThs,
     running_watts: runningWatts,
     rate_period: ratePeriod,
     rate_cents_per_kwh: rateCents,
