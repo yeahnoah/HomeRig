@@ -96,25 +96,36 @@ interface ProfitResponse {
   guard: { tripped: boolean; below_for_seconds: number | null };
 }
 
+interface ThermalCfg {
+  enabled: boolean;
+  chip_ceiling_c: number;
+  board_ceiling_c: number;
+  reset_margin_c: number;
+  faulty: { miner_id: number; board_id: number }[];
+}
+
 export default function SettingsPage() {
   const [view, setView] = useState<SettingsView | null>(null);
   const [miners, setMiners] = useState<SafeMiner[]>([]);
   const [electricity, setElectricity] = useState<ElectricityResponse | null>(null);
   const [profit, setProfit] = useState<ProfitResponse | null>(null);
+  const [thermal, setThermal] = useState<ThermalCfg | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const [s, m, e, p] = await Promise.all([
+    const [s, m, e, p, t] = await Promise.all([
       fetch('/api/settings').then((r) => r.json()),
       fetch('/api/miners').then((r) => r.json()),
       fetch('/api/electricity').then((r) => r.json()),
       fetch('/api/profitability').then((r) => r.json()),
+      fetch('/api/thermal').then((r) => r.json()),
     ]);
     setView(s);
     setMiners(m.miners ?? []);
     setElectricity(e ?? null);
     setProfit(p ?? null);
+    setThermal(t?.config ?? null);
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -143,6 +154,10 @@ export default function SettingsPage() {
 
       {profit && (
         <ProfitabilitySection profit={profit} onChange={refresh} setMsg={setMsg} />
+      )}
+
+      {thermal && (
+        <ThermalSettingsSection thermal={thermal} onChange={refresh} setMsg={setMsg} />
       )}
 
       <PollingSection settings={view.settings} onChange={refresh} setMsg={setMsg} />
@@ -968,6 +983,88 @@ function ProfitabilitySection({
           >
             {testing ? 'Testing…' : 'Test token'}
           </button>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-black hover:bg-accent/90 disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ----- Thermal watchdog -----
+
+function ThermalSettingsSection({
+  thermal, onChange, setMsg,
+}: {
+  thermal: ThermalCfg;
+  onChange: () => void;
+  setMsg: (s: string) => void;
+}) {
+  const [enabled, setEnabled] = useState(thermal.enabled);
+  const [boardCeil, setBoardCeil] = useState(thermal.board_ceiling_c);
+  const [chipCeil, setChipCeil] = useState(thermal.chip_ceiling_c);
+  const [resetMargin, setResetMargin] = useState(thermal.reset_margin_c);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setSaving(true);
+    await fetch('/api/thermal', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled,
+        board_ceiling_c: boardCeil,
+        chip_ceiling_c: chipCeil,
+        reset_margin_c: resetMargin,
+      }),
+    });
+    setSaving(false);
+    setMsg('Thermal watchdog saved');
+    onChange();
+  }
+
+  return (
+    <section className="space-y-3">
+      <h2 className="font-medium">Thermal watchdog</h2>
+      <div className="rounded-lg border border-border bg-surface p-4 space-y-4">
+        <p className="text-xs text-muted leading-relaxed">
+          Safety backstop for running with the miner&apos;s firmware{' '}
+          <span className="data">&ldquo;Override Chip Temperature Safety Check&rdquo;</span> enabled.
+          HomeRig pauses a miner when the <strong>independent board/PCB sensor</strong> shows real
+          heat — so a single faulty chip sensor (the phantom &ldquo;T2 = 110°C&rdquo; trips) won&apos;t
+          stop the rig, but a genuine overheat still will. Flag faulty chip sensors by clicking a
+          board on the dashboard&apos;s Hashboard thermals card.
+        </p>
+
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enable thermal watchdog
+        </label>
+
+        <div className="grid md:grid-cols-3 gap-3">
+          <Field label="Pause at PCB temp (°C)">
+            <Input value={String(boardCeil)} onChange={(v) => setBoardCeil(parseFloat(v) || 0)} className="data" />
+          </Field>
+          <Field label="Pause at trusted chip (°C)">
+            <Input value={String(chipCeil)} onChange={(v) => setChipCeil(parseFloat(v) || 0)} className="data" />
+          </Field>
+          <Field label="Resume margin (°C below)">
+            <Input value={String(resetMargin)} onChange={(v) => setResetMargin(parseFloat(v) || 0)} className="data" />
+          </Field>
+        </div>
+        <p className="text-[11px] text-muted leading-relaxed">
+          Measured healthy peak on your S21 XPs: ~83°C PCB / ~98°C chip at full load. Defaults
+          (90°C PCB / 105°C chip) sit above that with margin and well below the ~95°C PCB that
+          corresponds to a real 110°C chip. After {resetMargin}°C of cooling a paused miner
+          auto-resumes; after repeated trips it&apos;s held off until you intervene.
+        </p>
+
+        <div className="flex justify-end">
           <button
             onClick={save}
             disabled={saving}

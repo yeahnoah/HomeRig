@@ -35,6 +35,12 @@ import {
 } from './ha-plug';
 import { evaluateForMiner } from './blackouts';
 import { evaluateProfitability, type ProfitSnapshot } from './profitability';
+import {
+  getThermalConfig,
+  evaluateThermal,
+  safeToResume,
+  type ThermalEvaluation,
+} from './thermal-guard';
 import { sendAlert, clearAlertDedup } from './alerts';
 import type { Miner, MinerStats } from '@/types';
 
@@ -72,6 +78,15 @@ interface SchedulerState {
   profitTripped: boolean;
   /** Last computed snapshot, surfaced to the dashboard via getProfitState(). */
   lastProfitSnapshot: ProfitSnapshot | null;
+  // ── Thermal watchdog state ──
+  /** Miners currently paused by the thermal watchdog (cleared when temps drop). */
+  thermalLatched: Set<number>;
+  /** Miners that tripped too many times — paused until manual intervention. */
+  thermalHardLatched: Set<number>;
+  /** Per-miner thermal trip counter (session). */
+  thermalTrips: Map<number, number>;
+  /** Last thermal evaluation per miner, surfaced to the dashboard. */
+  lastThermalEval: Map<number, ThermalEvaluation>;
 }
 const g = globalThis as unknown as { __homerig?: SchedulerState };
 const state: SchedulerState =
@@ -87,12 +102,17 @@ const state: SchedulerState =
     profitBelowSince: null,
     profitTripped: false,
     lastProfitSnapshot: null,
+    thermalLatched: new Set<number>(),
+    thermalHardLatched: new Set<number>(),
+    thermalTrips: new Map<number, number>(),
+    lastThermalEval: new Map<number, ThermalEvaluation>(),
   });
 
 // ── Guard tunables ──
 const STARTUP_GRACE_MS = 60_000; // skip safety override for 60s after start
 const UNKNOWN_STATE_THRESHOLD = 3; // ticks before we trust an 'unknown' plug state
 const STUCK_RESUME_THRESHOLD = 3; // ticks of "alreadyMining + 0 hashrate" before alerting
+const MAX_THERMAL_TRIPS = 4; // thermal trips before we stop auto-resuming (hard latch)
 
 export function getLatestStats(): MinerStats[] {
   return Array.from(state.latestStats.values());
@@ -495,6 +515,116 @@ async function evaluateProfitGuard(now: Date): Promise<boolean> {
   return true;
 }
 
+/** Current thermal watchdog state per miner, for the dashboard / API. */
+export function getThermalState(): {
+  enabled: boolean;
+  miners: Record<number, {
+    latched: boolean;
+    hard_latched: boolean;
+    trips: number;
+    eval: ThermalEvaluation | null;
+  }>;
+} {
+  const cfg = getThermalConfig();
+  const out: Record<number, { latched: boolean; hard_latched: boolean; trips: number; eval: ThermalEvaluation | null }> = {};
+  const ids = new Set<number>([
+    ...state.lastThermalEval.keys(),
+    ...state.thermalLatched,
+    ...state.thermalHardLatched,
+  ]);
+  for (const id of ids) {
+    out[id] = {
+      latched: state.thermalLatched.has(id),
+      hard_latched: state.thermalHardLatched.has(id),
+      trips: state.thermalTrips.get(id) ?? 0,
+      eval: state.lastThermalEval.get(id) ?? null,
+    };
+  }
+  return { enabled: cfg.enabled, miners: out };
+}
+
+/**
+ * Thermal watchdog — the safety backstop for running with the firmware's
+ * dangerous-temp cutoff disabled. Force-pauses any miner showing real
+ * (corroborated) heat on the independent PCB sensor, overriding run/profit/
+ * blackout decisions. Latches until temps drop; hard-latches after repeated
+ * trips. Mutates `decisions`. Requires fresh stats (call after pollAllMiners).
+ */
+async function applyThermalGuard(
+  decisions: { miner: Miner; shouldPause: boolean; source: string }[]
+): Promise<void> {
+  const cfg = getThermalConfig();
+
+  // When disabled, clear any latches so re-enabling starts clean, but still
+  // record evaluations for the dashboard.
+  if (!cfg.enabled) {
+    state.thermalLatched.clear();
+    state.thermalHardLatched.clear();
+    state.thermalTrips.clear();
+  }
+
+  for (const d of decisions) {
+    const stats = state.latestStats.get(d.miner.id);
+    if (!stats || stats.status === 'offline') continue; // can't evaluate
+
+    const ev = evaluateThermal(d.miner.id, stats, cfg);
+    state.lastThermalEval.set(d.miner.id, ev);
+    if (!cfg.enabled) continue; // record for display, but don't act
+
+    // Hard-latched: stays paused until manual intervention (disable/restart).
+    if (state.thermalHardLatched.has(d.miner.id)) {
+      d.shouldPause = true;
+      d.source = 'thermal:hard-latch';
+      continue;
+    }
+
+    if (state.thermalLatched.has(d.miner.id)) {
+      // Latched-paused: clear only once temps drop below the reset margin.
+      if (safeToResume(d.miner.id, stats, cfg)) {
+        state.thermalLatched.delete(d.miner.id);
+        clearAlertDedup(`thermal:${d.miner.id}`);
+        logEvent({
+          miner_id: d.miner.id,
+          action: 'system',
+          source: 'thermal:guard',
+          result: 'success',
+          detail: `Thermal pause cleared — cooled to board ${ev.hottest_board_c.toFixed(0)}°C / chip ${ev.hottest_chip_c.toFixed(0)}°C`,
+        });
+      } else {
+        d.shouldPause = true;
+        d.source = 'thermal:overheat';
+      }
+    } else if (ev.danger) {
+      // New trip.
+      state.thermalLatched.add(d.miner.id);
+      const trips = (state.thermalTrips.get(d.miner.id) ?? 0) + 1;
+      state.thermalTrips.set(d.miner.id, trips);
+      d.shouldPause = true;
+      d.source = 'thermal:overheat';
+      logEvent({
+        miner_id: d.miner.id,
+        action: 'system',
+        source: 'thermal:guard',
+        result: 'error',
+        detail: `Thermal pause: ${ev.reason} (trip ${trips})`,
+      });
+      const hard = trips >= MAX_THERMAL_TRIPS;
+      if (hard) state.thermalHardLatched.add(d.miner.id);
+      await sendAlert({
+        key: hard ? `thermal:hard:${d.miner.id}` : `thermal:${d.miner.id}`,
+        title: hard
+          ? `${d.miner.name}: repeated overheating — held off`
+          : `${d.miner.name} paused — overheating`,
+        detail: hard
+          ? `${ev.reason}. Tripped ${trips}× — HomeRig will not auto-resume it. Check fans/airflow, then re-enable the thermal watchdog or restart the app.`
+          : `${ev.reason}. Paused until it cools down.`,
+        priority: 5,
+        tags: ['rotating_light', 'fire'],
+      });
+    }
+  }
+}
+
 export async function reconcile() {
   const miners = getEnabledMiners();
   const windows = getEnabledBlackouts();
@@ -519,15 +649,22 @@ export async function reconcile() {
     }
   }
 
+  // Refresh stats once before deciding so we have current status (and fresh
+  // per-board temps for the thermal watchdog).
+  await pollAllMiners().catch(() => {});
+
+  // ── Thermal watchdog (safety, highest priority) ──
+  // With the firmware dangerous-temp cutoff disabled, HomeRig is the backstop.
+  // Force-pause any miner showing real corroborated heat on the independent PCB
+  // sensor. Runs after the poll (needs fresh temps), before the plug drive.
+  await applyThermalGuard(decisions);
+
   const anyShouldRun = decisions.some((d) => !d.shouldPause);
   console.log(
     `[scheduler] reconcile: ${decisions.length} miners, anyShouldRun=${anyShouldRun}, decisions=${decisions
       .map((d) => `${d.miner.id}:${d.shouldPause ? 'P' : 'R'}`)
       .join(',')}`
   );
-
-  // Refresh stats once before deciding so we have current status.
-  await pollAllMiners().catch(() => {});
 
   const plugFullyConfigured =
     plug.enabled && plug.ha_url && plug.ha_entity_id && plug.ha_token_encrypted;
@@ -687,6 +824,9 @@ export function startScheduler() {
   state.stuckResumeStreak.clear();
   state.profitBelowSince = null;
   state.profitTripped = false;
+  state.thermalLatched.clear();
+  state.thermalHardLatched.clear();
+  state.thermalTrips.clear();
   const settings = getSettings();
 
   // Poll loop

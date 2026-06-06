@@ -303,11 +303,17 @@ export async function getMinerStats(miner: Miner, timeoutMs = 5000): Promise<Min
         const board_hr_instant =
           ghsInstant(h.stats?.realHashrate ?? h.stats?.real_hashrate) / 1000;
         totalBoardHrInstant += board_hr_instant;
+        const chipSensor = h.highestChipTemp ?? h.highest_chip_temp;
         const chipTemp = Number(
-          h.highestChipTemp?.temperature?.degreeC ??
-            h.highest_chip_temp?.temperature?.degree_c ??
-            0
+          chipSensor?.temperature?.degreeC ?? chipSensor?.temperature?.degree_c ?? 0
         );
+        const chipSensorIdRaw = chipSensor?.id;
+        const chipSensorId =
+          chipSensorIdRaw == null || chipSensorIdRaw === ''
+            ? null
+            : Number(
+                typeof chipSensorIdRaw === 'object' ? chipSensorIdRaw.value : chipSensorIdRaw
+              );
         const boardTemp = Number(h.boardTemp?.degreeC ?? h.board_temp?.degree_c ?? 0);
         const inletTemp = Number(
           h.lowestInletTemp?.degreeC ?? h.lowest_inlet_temp?.degree_c ?? 0
@@ -324,8 +330,10 @@ export async function getMinerStats(miner: Miner, timeoutMs = 5000): Promise<Min
           id: Number(h.id ?? idx + 1),
           hashrate_th: board_hr,
           temp_chip: chipTemp,
+          temp_board: boardTemp,
           temp_inlet: inletTemp || boardTemp, // fallback if inlet sensor not reported
-          temp_outlet: outletTemp,
+          temp_outlet: outletTemp || boardTemp,
+          chip_sensor_id: Number.isFinite(chipSensorId as number) ? (chipSensorId as number) : null,
           chips_count: chipsCount,
           enabled: Boolean(h.enabled),
         };

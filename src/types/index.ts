@@ -128,9 +128,14 @@ export interface MinerStats {
 export interface HashboardStats {
   id: number;
   hashrate_th: number;
+  /** Hottest chip-sensor reading (°C). This is the sensor that can be faulty. */
   temp_chip: number;
+  /** Board/PCB temperature (°C) — an INDEPENDENT sensor from the chip sensor. */
+  temp_board: number;
   temp_inlet: number;
   temp_outlet: number;
+  /** id of the hottest chip sensor reported by BOSer (for faulty-sensor flagging). */
+  chip_sensor_id: number | null;
   chips_count: number;
   enabled: boolean;
 }

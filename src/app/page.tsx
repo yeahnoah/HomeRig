@@ -6,6 +6,7 @@ import { HashrateChart, PowerCostChart, Sparkline, type ChartPoint } from '@/com
 import { CostPopover } from '@/components/dashboard/cost-popover';
 import { BoardStrip } from '@/components/dashboard/board-strip';
 import { ProjectionSection, EfficiencySection, type ModelSeed } from '@/components/dashboard/projection';
+import { ThermalSection } from '@/components/dashboard/thermal';
 import type { MinerStats } from '@/types';
 
 interface MinerRow {
@@ -314,6 +315,9 @@ export default function Dashboard() {
 
       {/* ── Profitability guard ── */}
       {profit?.snapshot.enabled && <ProfitabilityCard profit={profit} />}
+
+      {/* ── Hashboard thermals + watchdog ── */}
+      <ThermalSection miners={miners} />
 
       {/* ── Live efficiency (J/TH) ── */}
       {model && <EfficiencySection seed={model} />}
